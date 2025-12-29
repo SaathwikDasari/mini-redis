@@ -1,10 +1,9 @@
 use bytes::BytesMut;
 use tokio::net::TcpStream;
-use tokio::io::AsyncReadExt;
 use crate::frame::Frame;
-use std::fmt::{Error, format};
 use std::io::Cursor;
 use bytes::Buf;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub struct Connection {
     stream: TcpStream,
@@ -20,9 +19,6 @@ impl Connection {
         }
     }
 
-    /// - Ok(Some(Frame)): We successfully got a command.
-    /// - Ok(None): The client disconnected cleanly.
-    /// - Err(...): Something went wrong (network error).
     pub async fn read_frame(&mut self) -> Result<Option<Frame>, String> {
         loop {
             // 1. Check if we already have a full frame parsed
@@ -30,10 +26,7 @@ impl Connection {
                 return Ok(Some(frame));
             }
 
-            // 2. If not, read more data from the socket into the buffer
-            // `read_buf` returns 0 if the connection is closed
             if 0 == self.stream.read_buf(&mut self.buffer).await.map_err(|e| e.to_string())? {
-                // The remote closed the connection.
                 if self.buffer.is_empty() {
                     return Ok(None);
                 } else {
@@ -46,19 +39,56 @@ impl Connection {
 
     pub fn parse_frame(&mut self) -> Result<Option<Frame>, String> {
         
-            // Create the cursor
         let mut curs = Cursor::new(&self.buffer[..]);
 
-        // Call our new standalone helper
         match parse(&mut curs)? {
             Some(frame) => {
-                // If success, advance the REAL buffer by however much the cursor moved
                 let len = curs.position() as usize;
                 self.buffer.advance(len);
                 Ok(Some(frame))
             }
             None => Ok(None),
         }
+    }
+
+    pub async fn write_frame(&mut self, frame: &Frame) -> Result<(), std::io::Error> {
+        match frame {
+            Frame::Simple(val) => {
+                self.stream.write_u8(b'+').await?;
+                self.stream.write_all(val.as_bytes()).await?;
+                self.stream.write_all(b"\r\n").await?;
+            }
+            Frame::Error(val) => {
+                self.stream.write_u8(b'-').await?;
+                self.stream.write_all(val.as_bytes()).await?;
+                self.stream.write_all(b"\r\n").await?;
+            }
+            Frame::Integer(val) => {
+                self.stream.write_u8(b':').await?;
+                self.stream.write_all(val.to_string().as_bytes()).await?; // Convert int to string
+                self.stream.write_all(b"\r\n").await?;
+            }
+            Frame::Null => {
+                self.stream.write_all(b"$-1\r\n").await?;
+            }
+            Frame::Bulk(val) => {
+                self.stream.write_u8(b'$').await?;
+                self.stream.write_all(val.len().to_string().as_bytes()).await?;
+                self.stream.write_all(b"\r\n").await?;
+                self.stream.write_all(val).await?;
+                self.stream.write_all(b"\r\n").await?;
+            }
+            Frame::Array(_val) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other, 
+                    "Sending Arrays not supported in this mini-version"
+                ));
+            }
+        }
+        
+        self.stream.flush().await?;
+        
+        Ok(())
     }
 
 }
@@ -68,11 +98,9 @@ fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Frame>, String> {
         return Ok(None);
     }
 
-    // 1. Peek the first byte
     let first_byte = src.get_u8();
 
     match first_byte {
-        // Simple String (+)
         b'+' => {
             if let Some(line) = get_line(src)? {
                 let string = String::from_utf8(line.to_vec())
@@ -81,7 +109,6 @@ fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Frame>, String> {
             }
             Ok(None)
         }
-        // Bulk String ($)
         b'$' => {
             if let Some(line) = get_line(src)? {
                 let len_str = String::from_utf8(line.to_vec())
@@ -109,23 +136,19 @@ fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Frame>, String> {
             }
             Ok(None)
         }
-        // NEW: Arrays (*)
         b'*' => {
-            // 1. Read the length line: "*3\r\n" -> 3
             if let Some(line) = get_line(src)? {
                 let len_str = String::from_utf8(line.to_vec())
                     .map_err(|_| "Invalid UTF-8 length".to_string())?;
                 
                 let len: usize = len_str.parse().map_err(|_| "Invalid array length")?;
                 
-                // 2. Loop `len` times and parse sub-frames
                 let mut out = Vec::with_capacity(len);
                 
                 for _ in 0..len {
-                    // RECURSION: Call this same function for the inner items
                     match parse(src)? {
                         Some(frame) => out.push(frame),
-                        None => return Ok(None), // One of the inner items isn't ready yet
+                        None => return Ok(None), 
                     }
                 }
                 
@@ -137,9 +160,6 @@ fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Frame>, String> {
     }
 }
 
-// NOTE: You also need to move the `get_line` function OUT of `impl Connection`
-// so this standalone function can see it. 
-// Just cut and paste `get_line` to the bottom of the file too, removing `&self`.
 fn get_line<'a>(src: &mut Cursor<&'a [u8]>) -> Result<Option<&'a [u8]>, String> {
     let start = src.position() as usize;
     let end = src.get_ref().len();
